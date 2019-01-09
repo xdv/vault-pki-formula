@@ -71,6 +71,8 @@ checkgen
           the former into the new keys version directory.
         - Send the CSR in a Salt event call to the Salt master onward
           to be signed (with a return path to write the certificate at).
+        - Wait for signed CA from the Salt Master
+        - Write certificate to disk and activate new version
     - Otherwise if certificate is in OK, log that and exit.
 
 activate
@@ -131,6 +133,7 @@ from cryptography.hazmat.primitives import serialization
 import six
 
 from salt import client as salt_client
+from salt.utils import event as salt_event
 
 OWNER_UID = 0
 ACCESS_GROUP = 'cert-access'
@@ -179,6 +182,7 @@ KEY_FILENAME_TO_FORMAT = {
 }
 
 SALT_EVENT_TAG = 'request/sign'
+SALT_EVENT_RESPONSE_TAG = 'request/certificate'
 
 logger = logging.getLogger(__file__)
 
@@ -386,6 +390,50 @@ def send_cert_request(event_tag, new_version, dest_cert_path, csr):
                       path=dest_cert_path)
 
 
+def _wait_for_signed_cert_request(func=_minion_event):
+    """Capture signed certificate from event bus"""
+    return func()
+
+
+def _minion_event():
+    """Stub class to cert via MinionEvent"""
+    return salt_event.MinionEvent(**__opts__)
+    for ev in event.iter_events(tag=SALT_EVENT_RESPONSE_TAG):
+        return ev['data']
+
+
+def _get_certificate_id(cert_data):
+    """Extract the latest ID from certificate response"""
+    cert_path = cert_data["cert_path"]
+    index = cert.path.split("/")[5]
+    if index.isdigit():
+        return index
+    else:
+        return False
+
+
+def _write_certificate_data(cert, cert_path, ca, ca_path):
+    """Write out certificate data to filesystem"""
+
+    cert_write = _write_file(cert, cert_path)
+    ca_write = _write_file(ca, ca_path)
+
+    if cert_write and ca_write:
+        return True
+    else:
+        return False
+
+
+def _write_file(contents, path):
+    """Try to write file to filesystem"""
+    try:
+        with open(cert_path, 'w') as f:
+            f.write(cert)
+        return True
+    except IOError:
+        return False
+
+
 def _atomic_link_switch(source, destination):
     """Does an atomic symlink swap by overwriting the destination symlink.
 
@@ -437,6 +485,7 @@ def _activate_version(version_str, live_dir):
 
 def _activate_version_with_rollback(version_str, live_dir):
     """Activate a cert/key version but rollback to if errors occur.
+
 
     Records the current cert/key version before activation and if it
     is sane attempts to restore it in the event of an error occuring.
@@ -680,6 +729,27 @@ def checkgen_main(args):
                                     csr)
         if not sent_ok:
             logger.error('Error sending CSR to salt master!')
+            sys.exit(1)
+
+        certificate_data = _wait_for_signed_cert_request()
+        certificate_id = _get_certificate_id(certificate_data)
+
+        if not certificate_id:
+            logger.error('Error retrieving certificate ID')
+            sys.exit(1)
+
+        cert = certificate_data['cert']
+        cert_path = certificate_data['cert_path']
+        ca = certificate_data['fullchain']
+        ca_path = certificate_data['fullchain_path']
+
+        write_certificates = _write_certificate_data(cert, cert_path, ca, ca_path)
+        if write_certificates:
+            set_version = _activate_version_with_rollback(live_dir, certificate_id)
+            logger.info('Set version "{}" to active.'.format(set_version))
+            run_post_activate_scripts()
+        else:
+            logger.error('Error writing certificates to disk')
     else:
         logger.info('Cert Status: OK.')
 
